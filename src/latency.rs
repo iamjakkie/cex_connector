@@ -103,22 +103,6 @@ impl HighResTimer {
     }
 }
 
-// High-resolution timing functions - architecture specific
-#[cfg(target_arch = "x86_64")]
-unsafe fn rdtsc() -> u64 {
-    let mut high: u32;
-    let mut low: u32;
-    
-    std::arch::asm!(
-        "rdtsc",
-        out("eax") low,
-        out("edx") high,
-        options(nomem, nostack),
-    );
-    
-    ((high as u64) << 32) | (low as u64)
-}
-
 // For Apple Silicon (M1/M2) - use system counter
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 unsafe fn get_apple_timer() -> u64 {

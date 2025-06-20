@@ -24,7 +24,7 @@ unsafe fn rdtsc() -> u64 {
 // High-resolution timer using RDTSC
 pub struct HighResTimer {
     #[cfg(target_arch = "x86_64")]
-    cycles_per_ns: f64,
+    pub cycles_per_ns: f64,
     #[cfg(target_arch = "x86_64")]
     start_cycles: u64,
     

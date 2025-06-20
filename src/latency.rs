@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::websocket;
 
-static HIGH_RES_TIMER: OnceLock<HighResTimer> = OnceLock::new();
+pub static HIGH_RES_TIMER: OnceLock<HighResTimer> = OnceLock::new();
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn rdtsc() -> u64 {
@@ -21,19 +21,8 @@ unsafe fn rdtsc() -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-unsafe fn get_apple_timer() -> u64 {
-    let mut val: u64;
-    std::arch::asm!(
-        "mrs {}, cntvct_el0",
-        out(reg) val,
-        options(nomem, nostack),
-    );
-    val
-}
-
 // High-resolution timer using RDTSC
-struct HighResTimer {
+pub struct HighResTimer {
     #[cfg(target_arch = "x86_64")]
     cycles_per_ns: f64,
     #[cfg(target_arch = "x86_64")]
@@ -114,50 +103,60 @@ impl HighResTimer {
     }
 }
 
-fn get_high_res_time_ns() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Use RDTSC on x86_64
-        let timer = HIGH_RES_TIMER.get().unwrap();
-        timer.now_ns()
-    }
+// High-resolution timing functions - architecture specific
+#[cfg(target_arch = "x86_64")]
+unsafe fn rdtsc() -> u64 {
+    let mut high: u32;
+    let mut low: u32;
     
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        // Use Apple's system counter
-        let timer = HIGH_RES_TIMER.get().unwrap();
-        timer.now_ns()
-    }
+    std::arch::asm!(
+        "rdtsc",
+        out("eax") low,
+        out("edx") high,
+        options(nomem, nostack),
+    );
     
-    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_os = "macos"))))]
-    {
-        // Use std::time::Instant for other architectures
-        let timer = HIGH_RES_TIMER.get().unwrap();
-        timer.now_ns()
-    }
+    ((high as u64) << 32) | (low as u64)
 }
 
+// For Apple Silicon (M1/M2) - use system counter
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+unsafe fn get_apple_timer() -> u64 {
+    let mut val: u64;
+    std::arch::asm!(
+        "mrs {}, cntvct_el0",
+        out(reg) val,
+        options(nomem, nostack),
+    );
+    val
+}
+
+// Generic fallback - this will work on any architecture
+fn get_high_res_time_ns() -> u64 {
+    let timer = HIGH_RES_TIMER.get_or_init(|| HighResTimer::new());
+    timer.now_ns()
+}
 
 fn current_timestamp_ms_hires() -> u64 {
     let timer = HIGH_RES_TIMER.get_or_init(|| HighResTimer::new());
     timer.now_ms()
 }
 
-fn current_timestamp_ns_hires() -> u64 {
+pub fn current_timestamp_ns_hires() -> u64 {
     get_high_res_time_ns()
 }
 
 #[derive(Debug)]
-struct LatencyStats {
-    count: u64,
-    total_latency_ns: u64,    // Changed to nanoseconds for higher precision
+pub struct LatencyStats {
+    pub count: u64,
+    pub total_latency_ns: u64,    // Changed to nanoseconds for higher precision
     min_latency_ns: u64,
     max_latency_ns: u64,
-    last_10: Vec<u64>,        // Store nanoseconds
+    pub last_10: Vec<u64>,        // Store nanoseconds
 }
 
 impl LatencyStats {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             count: 0,
             total_latency_ns: 0,
@@ -167,7 +166,7 @@ impl LatencyStats {
         }
     }
     
-    fn add_measurement(&mut self, latency_ns: u64) {
+    pub fn add_measurement(&mut self, latency_ns: u64) {
         self.count += 1;
         self.total_latency_ns += latency_ns;
         self.min_latency_ns = self.min_latency_ns.min(latency_ns);
@@ -180,7 +179,7 @@ impl LatencyStats {
         self.last_10.push(latency_ns);
     }
     
-    fn average_latency_ms(&self) -> f64 {
+    pub fn average_latency_ms(&self) -> f64 {
         if self.count == 0 {
             0.0
         } else {
@@ -188,7 +187,7 @@ impl LatencyStats {
         }
     }
     
-    fn recent_average_ms(&self) -> f64 {
+    pub fn recent_average_ms(&self) -> f64 {
         if self.last_10.is_empty() {
             0.0
         } else {
@@ -197,11 +196,11 @@ impl LatencyStats {
         }
     }
     
-    fn min_latency_ms(&self) -> f64 {
+    pub fn min_latency_ms(&self) -> f64 {
         self.min_latency_ns as f64 / 1_000_000.0
     }
     
-    fn max_latency_ms(&self) -> f64 {
+    pub fn max_latency_ms(&self) -> f64 {
         self.max_latency_ns as f64 / 1_000_000.0
     }
 }

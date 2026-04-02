@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::io::{Read, Write, BufRead, BufReader};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::collections::HashMap;
@@ -6,6 +8,7 @@ use std::fmt;
 use std::error::Error as StdError;
 use std::sync::Arc;
 
+use rand::RngCore;
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use rustls::pki_types::ServerName;
 use sha1::{Sha1, Digest};
@@ -21,12 +24,6 @@ const OPCODE_PONG: u8 = 0xa;
 
 // WebSocket close codes
 const CLOSE_NORMAL: u16 = 1000;
-const CLOSE_GOING_AWAY: u16 = 1001;
-const CLOSE_PROTOCOL_ERROR: u16 = 1002;
-const CLOSE_UNSUPPORTED: u16 = 1003;
-const CLOSE_INVALID_DATA: u16 = 1007;
-const CLOSE_POLICY_VIOLATION: u16 = 1008;
-const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
 
 // Configuration constants
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16MB max frame size
@@ -43,7 +40,6 @@ pub enum WebSocketError {
     ConnectionClosed,
     FrameTooLarge,
     InvalidCloseCode(u16),
-    Timeout,
     TlsError(rustls::Error),
     DnsError(String),
 }
@@ -58,7 +54,6 @@ impl fmt::Display for WebSocketError {
             WebSocketError::ConnectionClosed => write!(f, "Connection closed"),
             WebSocketError::FrameTooLarge => write!(f, "Frame too large"),
             WebSocketError::InvalidCloseCode(code) => write!(f, "Invalid close code: {}", code),
-            WebSocketError::Timeout => write!(f, "Operation timed out"),
             WebSocketError::TlsError(e) => write!(f, "TLS error: {}", e),
             WebSocketError::DnsError(s) => write!(f, "DNS error: {}", s),
         }
@@ -131,7 +126,7 @@ impl Write for StreamType {
             StreamType::Tls(stream) => stream.write(buf),
         }
     }
-    
+
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             StreamType::Plain(stream) => stream.flush(),
@@ -145,57 +140,58 @@ pub struct WebSocketClient {
     config: WebSocketConfig,
     last_ping: Instant,
     closed: bool,
-    is_secure: bool,
+    // Reassembly buffer for fragmented messages
+    fragment_buffer: Vec<u8>,
+    fragment_opcode: u8,
 }
 
 impl WebSocketClient {
     pub fn connect(url: &str) -> Result<Self> {
         Self::connect_with_config(url, WebSocketConfig::default())
     }
-    
+
     pub fn connect_with_config(url: &str, config: WebSocketConfig) -> Result<Self> {
         let parsed_url = parse_websocket_url(url)?;
         let host = parsed_url.host.clone();
-        println!("Connecting to {}://{}:{}{}", 
-                 parsed_url.scheme, parsed_url.host, parsed_url.port, parsed_url.path);
-        
-        // Create socket address for connection
+        tracing::info!(
+            "Connecting to {}://{}:{}{}",
+            parsed_url.scheme, parsed_url.host, parsed_url.port, parsed_url.path
+        );
+
         let socket_addrs = format!("{}:{}", parsed_url.host, parsed_url.port)
             .to_socket_addrs()
             .map_err(|e| WebSocketError::DnsError(format!("Failed to resolve {}: {}", parsed_url.host, e)))?
             .collect::<Vec<_>>();
-        
+
         if socket_addrs.is_empty() {
             return Err(WebSocketError::DnsError(format!("No addresses found for {}", parsed_url.host)));
         }
-        
-        println!("Resolved {} to {:?}", parsed_url.host, socket_addrs[0]);
-        
+
+        tracing::debug!("Resolved {} to {:?}", parsed_url.host, socket_addrs[0]);
+
         let tcp_stream = TcpStream::connect_timeout(&socket_addrs[0], config.connect_timeout)?;
         tcp_stream.set_nodelay(true)?;
-        
+
         let stream = if parsed_url.scheme == "wss" {
-            // Create TLS configuration with updated rustls API
             let root_store = rustls::RootCertStore {
                 roots: webpki_roots::TLS_SERVER_ROOTS.into(),
             };
-            
+
             let tls_config = ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
-            
+
             let server_name = ServerName::try_from(host)
                 .map_err(|e| WebSocketError::DnsError(format!("Invalid server name '{}': {}", parsed_url.host, e)))?;
-            
+
             let client_conn = ClientConnection::new(Arc::new(tls_config), server_name)?;
             let tls_stream = StreamOwned::new(client_conn, tcp_stream);
-            
+
             StreamType::Tls(tls_stream)
         } else {
             StreamType::Plain(tcp_stream)
         };
-        
-        // Set timeouts (for TLS streams, this affects the underlying TCP stream)
+
         match &stream {
             StreamType::Plain(tcp) => {
                 tcp.set_read_timeout(config.read_timeout)?;
@@ -206,26 +202,23 @@ impl WebSocketClient {
                 tls_stream.get_ref().set_write_timeout(config.write_timeout)?;
             }
         }
-        
+
         let mut client = WebSocketClient {
             stream,
             config,
             last_ping: Instant::now(),
             closed: false,
-            is_secure: parsed_url.scheme == "wss",
+            fragment_buffer: Vec::new(),
+            fragment_opcode: 0,
         };
-        
+
         client.perform_handshake(&parsed_url.host, &parsed_url.path)?;
         Ok(client)
     }
-    
+
     fn perform_handshake(&mut self, host: &str, path: &str) -> Result<()> {
-        // Generate cryptographically secure WebSocket key
         let key = generate_websocket_key();
-        println!("Generated WebSocket key: {}", key);
-        println!("Key length: {} characters", key.len());
-        
-        // Send HTTP upgrade request
+
         let request = format!(
             "GET {} HTTP/1.1\r\n\
              Host: {}\r\n\
@@ -238,24 +231,22 @@ impl WebSocketClient {
              \r\n",
             path, host, key, self.config.user_agent, host
         );
-        
+
         self.stream.write_all(request.as_bytes())?;
         self.stream.flush()?;
-        
-        // Read and validate HTTP response
+
         let mut reader = BufReader::new(&mut self.stream);
         let mut response_line = String::new();
         reader.read_line(&mut response_line)?;
-        
-        println!("Server response: {}", response_line.trim());
-        
+
+        tracing::debug!("Server response: {}", response_line.trim());
+
         if !response_line.starts_with("HTTP/1.1 101") {
             return Err(WebSocketError::HandshakeError(
                 format!("Expected 101 Switching Protocols, got: {}", response_line.trim())
             ));
         }
-        
-        // Read and validate headers
+
         let mut headers = HashMap::new();
         loop {
             let mut line = String::new();
@@ -263,77 +254,61 @@ impl WebSocketClient {
             if line.trim().is_empty() {
                 break;
             }
-            
-            if let Some((key, value)) = line.split_once(':') {
-                headers.insert(
-                    key.trim().to_lowercase(), 
-                    value.trim().to_string()
-                );
+
+            if let Some((k, v)) = line.split_once(':') {
+                headers.insert(k.trim().to_lowercase(), v.trim().to_string());
             }
         }
-        
-        println!("Handshake headers received: {:?}", headers);
-        
-        // Validate required headers
+
         self.validate_handshake_headers(&headers, &key)?;
-        
-        println!("✅ WebSocket handshake successful!");
+
+        tracing::info!("WebSocket handshake successful");
         Ok(())
     }
-    
+
     fn validate_handshake_headers(&self, headers: &HashMap<String, String>, key: &str) -> Result<()> {
-        // Check upgrade header
         if headers.get("upgrade").map(|s| s.to_lowercase()) != Some("websocket".to_string()) {
             return Err(WebSocketError::HandshakeError(
                 "Missing or invalid Upgrade header".to_string()
             ));
         }
-        
-        // Check connection header
+
         if !headers.get("connection")
             .map(|s| s.to_lowercase().contains("upgrade"))
-            .unwrap_or(false) {
+            .unwrap_or(false)
+        {
             return Err(WebSocketError::HandshakeError(
                 "Missing or invalid Connection header".to_string()
             ));
         }
-        
-        // Verify Sec-WebSocket-Accept
-        if let Some(accept_key) = headers.get("sec-websocket-accept") {
-            let expected_accept = generate_accept_key(key);
-            println!("WebSocket key used: {}", key);
-            println!("Combined string: {}{}", key, WEBSOCKET_MAGIC_STRING);
-            println!("Expected accept key: {}", expected_accept);
-            println!("Received accept key: {}", accept_key);
-            println!("Expected length: {}, Received length: {}", expected_accept.len(), accept_key.len());
-            if accept_key != &expected_accept {
-                return Err(WebSocketError::HandshakeError(
-                    format!("Invalid Sec-WebSocket-Accept header. Expected: {}, Got: {}", expected_accept, accept_key)
-                ));
-            }
-        } else {
+
+        let accept_key = headers.get("sec-websocket-accept")
+            .ok_or_else(|| WebSocketError::HandshakeError("Missing Sec-WebSocket-Accept header".to_string()))?;
+
+        let expected_accept = generate_accept_key(key);
+        if accept_key != &expected_accept {
             return Err(WebSocketError::HandshakeError(
-                "Missing Sec-WebSocket-Accept header".to_string()
+                format!("Invalid Sec-WebSocket-Accept. Expected: {}, got: {}", expected_accept, accept_key)
             ));
         }
-        
+
         Ok(())
     }
-    
+
     pub fn send_text(&mut self, text: &str) -> Result<()> {
         if self.closed {
             return Err(WebSocketError::ConnectionClosed);
         }
         self.send_frame(OPCODE_TEXT, text.as_bytes())
     }
-    
+
     pub fn send_binary(&mut self, data: &[u8]) -> Result<()> {
         if self.closed {
             return Err(WebSocketError::ConnectionClosed);
         }
         self.send_frame(OPCODE_BINARY, data)
     }
-    
+
     pub fn send_ping(&mut self, data: &[u8]) -> Result<()> {
         if self.closed {
             return Err(WebSocketError::ConnectionClosed);
@@ -347,7 +322,7 @@ impl WebSocketClient {
         self.last_ping = Instant::now();
         Ok(())
     }
-    
+
     pub fn send_pong(&mut self, data: &[u8]) -> Result<()> {
         if self.closed {
             return Err(WebSocketError::ConnectionClosed);
@@ -359,50 +334,49 @@ impl WebSocketClient {
         }
         self.send_frame(OPCODE_PONG, data)
     }
-    
+
     pub fn close(&mut self) -> Result<()> {
         self.close_with_code(CLOSE_NORMAL, "")
     }
-    
+
     pub fn close_with_code(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.closed {
             return Ok(());
         }
-        
+
         if !is_valid_close_code(code) {
             return Err(WebSocketError::InvalidCloseCode(code));
         }
-        
+
         let reason_bytes = reason.as_bytes();
         if reason_bytes.len() > 123 {
             return Err(WebSocketError::ProtocolError(
                 "Close reason too long (max 123 bytes)".to_string()
             ));
         }
-        
+
         let mut payload = Vec::with_capacity(2 + reason_bytes.len());
         payload.extend_from_slice(&code.to_be_bytes());
         payload.extend_from_slice(reason_bytes);
-        
+
         self.send_frame(OPCODE_CLOSE, &payload)?;
         self.closed = true;
         Ok(())
     }
-    
+
     fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
         if payload.len() > self.config.max_frame_size {
             return Err(WebSocketError::FrameTooLarge);
         }
-        
+
         let mut frame = Vec::new();
-        
+
         // First byte: FIN (1) + RSV (000) + Opcode (4 bits)
         frame.push(0x80 | opcode);
-        
-        // Generate cryptographically secure mask key
-        let mask_key = generate_mask_key();
-        
-        // Payload length and masking bit
+
+        let mut mask_key = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut mask_key);
+
         let payload_len = payload.len();
         if payload_len < 126 {
             frame.push(0x80 | payload_len as u8);
@@ -413,90 +387,120 @@ impl WebSocketClient {
             frame.push(0x80 | 127);
             frame.extend_from_slice(&(payload_len as u64).to_be_bytes());
         }
-        
-        // Add mask key
+
         frame.extend_from_slice(&mask_key);
-        
-        // Add masked payload
+
         for (i, &byte) in payload.iter().enumerate() {
             frame.push(byte ^ mask_key[i % 4]);
         }
-        
+
         self.stream.write_all(&frame)?;
         self.stream.flush()?;
         Ok(())
     }
-    
+
     pub fn read_message(&mut self) -> Result<WebSocketMessage> {
         if self.closed {
             return Err(WebSocketError::ConnectionClosed);
         }
-        
-        // Check if we need to send a ping
+
         if self.last_ping.elapsed() > self.config.ping_interval {
-            let _ = self.send_ping(b"ping"); // Ignore ping errors
+            if let Err(e) = self.send_ping(b"ping") {
+                tracing::warn!("Failed to send keepalive ping: {}", e);
+            }
         }
-        
-        let frame = self.read_frame()?;
-        
-        match frame.opcode {
-            OPCODE_TEXT => {
-                let text = String::from_utf8(frame.payload)?;
-                Ok(WebSocketMessage::Text(text))
-            }
-            OPCODE_BINARY => Ok(WebSocketMessage::Binary(frame.payload)),
-            OPCODE_PING => {
-                // Auto-respond to pings
-                let _ = self.send_pong(&frame.payload);
-                Ok(WebSocketMessage::Ping(frame.payload))
-            }
-            OPCODE_PONG => Ok(WebSocketMessage::Pong(frame.payload)),
-            OPCODE_CLOSE => {
-                self.closed = true;
-                let (code, reason) = if frame.payload.len() >= 2 {
-                    let code = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
-                    let reason = if frame.payload.len() > 2 {
-                        String::from_utf8_lossy(&frame.payload[2..]).to_string()
+
+        loop {
+            let frame = self.read_frame()?;
+
+            // Handle control frames immediately regardless of fragmentation state
+            match frame.opcode {
+                OPCODE_PING => {
+                    self.send_pong(&frame.payload)?;
+                    return Ok(WebSocketMessage::Ping(frame.payload));
+                }
+                OPCODE_PONG => {
+                    return Ok(WebSocketMessage::Pong(frame.payload));
+                }
+                OPCODE_CLOSE => {
+                    self.closed = true;
+                    let (code, reason) = if frame.payload.len() >= 2 {
+                        let code = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+                        let reason = if frame.payload.len() > 2 {
+                            String::from_utf8_lossy(&frame.payload[2..]).to_string()
+                        } else {
+                            String::new()
+                        };
+                        (Some(code), reason)
                     } else {
-                        String::new()
+                        (None, String::new())
                     };
-                    (Some(code), reason)
-                } else {
-                    (None, String::new())
-                };
-                Ok(WebSocketMessage::Close { code, reason })
+                    return Ok(WebSocketMessage::Close { code, reason });
+                }
+                _ => {}
             }
-            _ => Err(WebSocketError::ProtocolError(
-                format!("Unknown opcode: {}", frame.opcode)
-            )),
+
+            if frame.opcode == OPCODE_CONTINUATION {
+                if self.fragment_buffer.is_empty() {
+                    return Err(WebSocketError::ProtocolError(
+                        "Unexpected continuation frame".to_string()
+                    ));
+                }
+                self.fragment_buffer.extend_from_slice(&frame.payload);
+            } else {
+                // New data frame
+                if !self.fragment_buffer.is_empty() {
+                    return Err(WebSocketError::ProtocolError(
+                        "New data frame while fragmented message is in progress".to_string()
+                    ));
+                }
+                if frame.fin {
+                    // Complete unfragmented message — fast path
+                    return match frame.opcode {
+                        OPCODE_TEXT => Ok(WebSocketMessage::Text(String::from_utf8(frame.payload)?)),
+                        OPCODE_BINARY => Ok(WebSocketMessage::Binary(frame.payload)),
+                        _ => Err(WebSocketError::ProtocolError(format!("Unknown opcode: {}", frame.opcode))),
+                    };
+                }
+                self.fragment_opcode = frame.opcode;
+                self.fragment_buffer = frame.payload;
+            }
+
+            if frame.fin {
+                // Final fragment — reassemble
+                let opcode = self.fragment_opcode;
+                let payload = std::mem::take(&mut self.fragment_buffer);
+                return match opcode {
+                    OPCODE_TEXT => Ok(WebSocketMessage::Text(String::from_utf8(payload)?)),
+                    OPCODE_BINARY => Ok(WebSocketMessage::Binary(payload)),
+                    _ => Err(WebSocketError::ProtocolError(format!("Unknown opcode: {}", opcode))),
+                };
+            }
         }
     }
-    
+
     fn read_frame(&mut self) -> Result<WebSocketFrame> {
         let mut header = [0u8; 2];
         self.stream.read_exact(&mut header)?;
-        
+
         let fin = (header[0] & 0x80) != 0;
         let rsv = (header[0] & 0x70) >> 4;
         let opcode = header[0] & 0x0f;
         let masked = (header[1] & 0x80) != 0;
         let mut payload_len = (header[1] & 0x7f) as u64;
-        
-        // Validate reserved bits
+
         if rsv != 0 {
             return Err(WebSocketError::ProtocolError(
                 "Reserved bits must be zero".to_string()
             ));
         }
-        
-        // Server frames must not be masked
+
         if masked {
             return Err(WebSocketError::ProtocolError(
                 "Server frames must not be masked".to_string()
             ));
         }
-        
-        // Extended payload length
+
         if payload_len == 126 {
             let mut len_bytes = [0u8; 2];
             self.stream.read_exact(&mut len_bytes)?;
@@ -505,27 +509,23 @@ impl WebSocketClient {
             let mut len_bytes = [0u8; 8];
             self.stream.read_exact(&mut len_bytes)?;
             payload_len = u64::from_be_bytes(len_bytes);
-            
-            // Check for valid payload length
+
             if payload_len & 0x8000_0000_0000_0000 != 0 {
                 return Err(WebSocketError::ProtocolError(
                     "Invalid payload length".to_string()
                 ));
             }
         }
-        
-        // Check frame size limit
+
         if payload_len as usize > self.config.max_frame_size {
             return Err(WebSocketError::FrameTooLarge);
         }
-        
-        // Read payload
+
         let mut payload = vec![0u8; payload_len as usize];
         if payload_len > 0 {
             self.stream.read_exact(&mut payload)?;
         }
-        
-        // Validate control frames
+
         if is_control_frame(opcode) {
             if !fin {
                 return Err(WebSocketError::ProtocolError(
@@ -538,20 +538,22 @@ impl WebSocketClient {
                 ));
             }
         }
-        
-        Ok(WebSocketFrame {
-            fin,
-            opcode,
-            payload,
-        })
+
+        Ok(WebSocketFrame { fin, opcode, payload })
     }
-    
+
     pub fn is_closed(&self) -> bool {
         self.closed
     }
-    
-    pub fn is_secure(&self) -> bool {
-        self.is_secure
+
+}
+
+impl Drop for WebSocketClient {
+    fn drop(&mut self) {
+        if !self.closed {
+            // Best-effort close frame on drop; ignore errors
+            let _ = self.close();
+        }
     }
 }
 
@@ -571,7 +573,6 @@ pub enum WebSocketMessage {
     Close { code: Option<u16>, reason: String },
 }
 
-// URL parsing structure
 #[derive(Debug)]
 struct ParsedWebSocketUrl {
     scheme: String,
@@ -581,123 +582,59 @@ struct ParsedWebSocketUrl {
 }
 
 fn parse_websocket_url(url: &str) -> Result<ParsedWebSocketUrl> {
-    if let Some(scheme_end) = url.find("://") {
-        let scheme = &url[..scheme_end];
-        let rest = &url[scheme_end + 3..];
-        
-        let (host_port, path) = if let Some(path_start) = rest.find('/') {
-            (&rest[..path_start], &rest[path_start..])
-        } else {
-            (rest, "/")
-        };
-        
-        let (host, port) = if let Some(port_start) = host_port.rfind(':') {
-            let host = &host_port[..port_start];
-            let port_str = &host_port[port_start + 1..];
-            let port = port_str.parse().map_err(|_| {
-                WebSocketError::ProtocolError("Invalid port number".to_string())
-            })?;
-            (host, port)
-        } else {
-            let default_port = match scheme {
-                "ws" => 80,
-                "wss" => 443,
-                _ => return Err(WebSocketError::ProtocolError("Invalid scheme".to_string())),
-            };
-            (host_port, default_port)
-        };
-        
-        Ok(ParsedWebSocketUrl {
-            scheme: scheme.to_string(),
-            host: host.to_string(),
-            port,
-            path: path.to_string(),
-        })
-    } else {
-        Err(WebSocketError::ProtocolError("Invalid URL format".to_string()))
-    }
-}
+    let scheme_end = url.find("://")
+        .ok_or_else(|| WebSocketError::ProtocolError("Invalid URL format".to_string()))?;
 
-// Utility functions
+    let scheme = &url[..scheme_end];
+    let rest = &url[scheme_end + 3..];
+
+    let (host_port, path) = if let Some(path_start) = rest.find('/') {
+        (&rest[..path_start], &rest[path_start..])
+    } else {
+        (rest, "/")
+    };
+
+    let (host, port) = if let Some(port_start) = host_port.rfind(':') {
+        let host = &host_port[..port_start];
+        let port_str = &host_port[port_start + 1..];
+        let port = port_str.parse().map_err(|_| {
+            WebSocketError::ProtocolError("Invalid port number".to_string())
+        })?;
+        (host, port)
+    } else {
+        let default_port = match scheme {
+            "ws" => 80,
+            "wss" => 443,
+            _ => return Err(WebSocketError::ProtocolError(format!("Unsupported scheme: {}", scheme))),
+        };
+        (host_port, default_port)
+    };
+
+    Ok(ParsedWebSocketUrl {
+        scheme: scheme.to_string(),
+        host: host.to_string(),
+        port,
+        path: path.to_string(),
+    })
+}
 
 fn generate_websocket_key() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::SystemTime;
-    
-    // Generate pseudo-random 16 bytes using available entropy
-    let mut entropy = Vec::new();
-    entropy.extend_from_slice(&SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default().as_nanos().to_le_bytes());
-    
-    let mut hasher = DefaultHasher::new();
-    entropy.hash(&mut hasher);
-    std::ptr::addr_of!(hasher).hash(&mut hasher);
-    
-    let hash = hasher.finish();
-    let bytes = [
-        (hash & 0xFF) as u8,
-        ((hash >> 8) & 0xFF) as u8,
-        ((hash >> 16) & 0xFF) as u8,
-        ((hash >> 24) & 0xFF) as u8,
-        ((hash >> 32) & 0xFF) as u8,
-        ((hash >> 40) & 0xFF) as u8,
-        ((hash >> 48) & 0xFF) as u8,
-        ((hash >> 56) & 0xFF) as u8,
-        // Add more entropy
-        (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().subsec_nanos() & 0xFF) as u8,
-        ((SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().subsec_nanos() >> 8) & 0xFF) as u8,
-        ((SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().subsec_nanos() >> 16) & 0xFF) as u8,
-        ((SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().subsec_nanos() >> 24) & 0xFF) as u8,
-        // Additional padding
-        0x01, 0x02, 0x03, 0x04,
-    ];
-    
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
     BASE64_STANDARD.encode(&bytes)
-}
-
-fn generate_mask_key() -> [u8; 4] {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::SystemTime;
-    
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now().hash(&mut hasher);
-    std::thread::current().id().hash(&mut hasher);
-    
-    let hash = hasher.finish();
-    [
-        (hash & 0xFF) as u8,
-        ((hash >> 8) & 0xFF) as u8,
-        ((hash >> 16) & 0xFF) as u8,
-        ((hash >> 24) & 0xFF) as u8,
-    ]
 }
 
 fn generate_accept_key(key: &str) -> String {
-    // NOTE: This is a simplified implementation for demo purposes
-    // In production, you should use proper SHA-1 hashing
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    
     let combined = format!("{}{}", key, WEBSOCKET_MAGIC_STRING);
     let mut hasher = Sha1::new();
     hasher.update(combined.as_bytes());
-    
-    // Convert to bytes and base64 encode
-    let bytes = hasher.finalize();
-    BASE64_STANDARD.encode(&bytes)
+    BASE64_STANDARD.encode(hasher.finalize())
 }
-
-// Remove the custom base64 implementation entirely - we have a proper library now
 
 fn is_control_frame(opcode: u8) -> bool {
     opcode >= 0x8
 }
 
 fn is_valid_close_code(code: u16) -> bool {
-    match code {
-        1000..=1003 | 1007..=1011 | 3000..=4999 => true,
-        _ => false,
-    }
+    matches!(code, 1000..=1003 | 1007..=1011 | 3000..=4999)
 }

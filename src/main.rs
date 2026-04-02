@@ -1,227 +1,184 @@
-use std::{str::FromStr, time::{Duration, Instant}};
+use std::time::{Duration, Instant};
 
-use latency::{current_timestamp_ns_hires, LatencyStats, HIGH_RES_TIMER};
-use tungstenite::{connect, Message};
-use url::Url;
-use websocket::{WebSocketClient, WebSocketConfig, WebSocketError, WebSocketMessage, Result};
+use latency::{current_timestamp_ns_hires, LatencyStats};
+use serde::Deserialize;
+use websocket::{WebSocketClient, WebSocketConfig, WebSocketMessage, Result};
 
 mod latency;
 mod websocket;
 
+const OKX_WS_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
+// Minimal structs for OKX order book message deserialization
+#[derive(Deserialize)]
+struct OkxMessage {
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    arg: Option<OkxArg>,
+    #[serde(default)]
+    data: Option<Vec<OkxBookData>>,
+}
+
+#[derive(Deserialize)]
+struct OkxArg {
+    channel: String,
+}
+
+#[derive(Deserialize)]
+struct OkxBookData {
+    ts: String,
+}
 
 fn main() -> Result<()> {
-    
-    // let config = WebSocketConfig {
-    //     connect_timeout: Duration::from_secs(10),
-    //     read_timeout: Some(Duration::from_secs(30)),
-    //     write_timeout: Some(Duration::from_secs(10)),
-    //     max_frame_size: 1024 * 1024, // 1MB
-    //     ping_interval: Duration::from_secs(30),
-    //     user_agent: "OKXWebSocketClient/1.0".to_string(),
-    // };
-    
-    // let mut client = WebSocketClient::connect_with_config(
-    //     "wss://ws.okx.com:8443/ws/v5/public",
-    //     config
-    // )?;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .init();
 
-    let mut socket = connect("wss://ws.okx.com:8443/ws/v5/public").unwrap().0;
-    
-    let orderbook_subscribe = r#"{
-        "op": "subscribe",
-        "args": [
-            {
-                "channel": "books5",
-                "instId": "BTC-USDT"
-            }
-        ]
-    }"#;
-    
-    // client.send_text(orderbook_subscribe)?;
+    let config = WebSocketConfig {
+        connect_timeout: Duration::from_secs(10),
+        read_timeout: Some(Duration::from_secs(30)),
+        write_timeout: Some(Duration::from_secs(10)),
+        ping_interval: Duration::from_secs(30),
+        ..Default::default()
+    };
 
-    socket.send(Message::Text(orderbook_subscribe.into()));
+    let mut client = WebSocketClient::connect_with_config(OKX_WS_URL, config)?;
 
+    let orderbook_subscribe = r#"{"op":"subscribe","args":[{"channel":"books5","instId":"BTC-USDT"}]}"#;
+    client.send_text(orderbook_subscribe)?;
 
-    let mut latency_stats = LatencyStats::new();
+    let mut latency_stats = LatencyStats::default();
     let mut last_stats_print = Instant::now();
-    let stats_interval = Duration::from_secs(5); // Print stats every 5 seconds
-    
-    println!("📊 Measuring order book latency...");
-    println!("Press Ctrl+C to stop\n");
 
-    // logic to listen to the messages and calculate latency
+    println!("Measuring order book latency. Press Ctrl+C to stop.\n");
+
     loop {
-        match socket.read_message() {
-            Ok(msg) => {
-                match msg {
-                    Message::Text(text) => {
-                        // Check if this is a subscription confirmation
-                        if text.contains("\"event\":\"subscribe\"") && text.contains("\"channel\":\"books5\"") {
-                            println!("✅ Successfully subscribed to BTC-USDT order book");
-                            continue;
-                        }
-                        
-                        // Check if this is order book data
-                        if text.contains("\"channel\":\"books5\"") && text.contains("\"data\":[") {
-                            let receive_time_ns = current_timestamp_ns_hires();
+        match client.read_message() {
+            Ok(WebSocketMessage::Text(text)) => {
+                let msg: OkxMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!("Failed to parse message: {}", e);
+                        continue;
+                    }
+                };
 
-                            println!("{:?}", text);
-                            
-                            if let Some(exchange_timestamp_ms) = extract_timestamp_from_message(&text) {
-                                let exchange_timestamp_ns = exchange_timestamp_ms * 1_000_000; // Convert ms to ns
+                // Subscription confirmation
+                if msg.event.as_deref() == Some("subscribe") {
+                    if let Some(arg) = &msg.arg {
+                        tracing::info!("Subscribed to channel: {}", arg.channel);
+                    }
+                    continue;
+                }
+
+                // Order book data
+                if let Some(data) = &msg.data {
+                    let receive_time_ns = current_timestamp_ns_hires();
+
+                    if let Some(entry) = data.first() {
+                        match entry.ts.parse::<u64>() {
+                            Ok(exchange_timestamp_ms) => {
+                                let exchange_timestamp_ns = exchange_timestamp_ms * 1_000_000;
                                 let latency_ns = receive_time_ns.saturating_sub(exchange_timestamp_ns);
                                 let latency_ms = latency_ns as f64 / 1_000_000.0;
-                                
+
                                 latency_stats.add_measurement(latency_ns);
-                                
-                                // Print individual measurements (for first few or outliers)
-                                if latency_stats.count <= 5 || latency_ns > 100_000_000 { // 100ms in ns
-                                    println!("📚 Order book update #{}: {:.3}ms latency ({:.0}ns precision)", 
-                                           latency_stats.count, latency_ms, latency_ns as f64 % 1_000_000.0);
+
+                                if latency_stats.count <= 5 || latency_ns > 100_000_000 {
+                                    println!(
+                                        "Update #{}: {:.3}ms latency",
+                                        latency_stats.count, latency_ms
+                                    );
                                 }
-                            } else {
-                                println!("⚠️  Could not extract timestamp from order book message");
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to parse timestamp '{}': {}", entry.ts, e);
                             }
                         }
-                    },
-                    _ => {
-                        println!("Received non-text message: {:?}", msg);
                     }
-                }
-                // match msg {
-                //     WebSocketMessage::Text(text) => {
-                //         // Check if this is a subscription confirmation
-                //         if text.contains("\"event\":\"subscribe\"") && text.contains("\"channel\":\"books5\"") {
-                //             println!("✅ Successfully subscribed to BTC-USDT order book");
-                //             continue;
-                //         }
-                        
-                //         // Check if this is order book data
-                //         if text.contains("\"channel\":\"books5\"") && text.contains("\"data\":[") {
-                //             let receive_time_ns = current_timestamp_ns_hires();
-
-                //             println!("{:?}", text);
-                            
-                //             if let Some(exchange_timestamp_ms) = extract_timestamp_from_message(&text) {
-                //                 let exchange_timestamp_ns = exchange_timestamp_ms * 1_000_000; // Convert ms to ns
-                //                 let latency_ns = receive_time_ns.saturating_sub(exchange_timestamp_ns);
-                //                 let latency_ms = latency_ns as f64 / 1_000_000.0;
-                                
-                //                 latency_stats.add_measurement(latency_ns);
-                                
-                //                 // Print individual measurements (for first few or outliers)
-                //                 if latency_stats.count <= 5 || latency_ns > 100_000_000 { // 100ms in ns
-                //                     println!("📚 Order book update #{}: {:.3}ms latency ({:.0}ns precision)", 
-                //                            latency_stats.count, latency_ms, latency_ns as f64 % 1_000_000.0);
-                //                 }
-                //             } else {
-                //                 println!("⚠️  Could not extract timestamp from order book message");
-                //             }
-                //         }
-                //     }
-                //     WebSocketMessage::Ping(_) => {
-                //         println!("🏓 Received ping from OKX");
-                //     }
-                //     WebSocketMessage::Pong(_) => {
-                //         println!("🏓 Received pong from OKX");
-                //     }
-                //     WebSocketMessage::Close { code, reason } => {
-                //         println!("❌ Connection closed by OKX - Code: {:?}, Reason: {}", code, reason);
-                //         break;
-                //     }
-                //     _ => {}
-                // }
-                
-                // Print periodic statistics
-                if last_stats_print.elapsed() >= stats_interval && latency_stats.count > 0 {
-                    println!("\n📈 === High-Resolution Latency Statistics (last {} seconds) ===", stats_interval.as_secs());
-                    println!("   📊 Total measurements: {}", latency_stats.count);
-                    println!("   ⚡ Average latency: {:.3}ms", latency_stats.average_latency_ms());
-                    println!("   🚀 Recent average (last 10): {:.3}ms", latency_stats.recent_average_ms());
-                    println!("   🟢 Min latency: {:.3}ms", latency_stats.min_latency_ms());
-                    println!("   🔴 Max latency: {:.3}ms", latency_stats.max_latency_ms());
-                    
-                    // Show recent latency trend with nanosecond precision
-                    if latency_stats.last_10.len() >= 5 {
-                        let recent: Vec<String> = latency_stats.last_10.iter()
-                            .map(|&ns| format!("{:.3}ms", ns as f64 / 1_000_000.0))
-                            .collect();
-                        println!("   📊 Recent latencies: [{}]", recent.join(", "));
-                    }
-                    
-                    // Show precision improvement
-                    if latency_stats.count > 10 {
-                        let std_dev = calculate_std_dev(&latency_stats.last_10);
-                        println!("   📏 Recent std deviation: {:.3}ms ({:.0}μs)", 
-                               std_dev / 1_000_000.0, std_dev / 1_000.0);
-                    }
-                    println!();
-                    
-                    last_stats_print = Instant::now();
                 }
             }
-            // Err(WebSocketError::Timeout) => {
-            //     println!("⏰ Read timeout, sending ping...");
-            //     if let Err(e) = client.send_ping(b"latency-test") {
-            //         eprintln!("❌ Failed to send ping: {}", e);
-            //         break;
-            //     }
-            // }
+            Ok(WebSocketMessage::Ping(_)) => {
+                tracing::debug!("Received ping from server");
+            }
+            Ok(WebSocketMessage::Pong(_)) => {
+                tracing::debug!("Received pong from server");
+            }
+            Ok(WebSocketMessage::Close { code, reason }) => {
+                tracing::info!("Connection closed by server - code: {:?}, reason: {}", code, reason);
+                break;
+            }
+            Ok(WebSocketMessage::Binary(_)) => {
+                tracing::debug!("Received unexpected binary message");
+            }
             Err(e) => {
-                eprintln!("❌ Error reading message: {}", e);
+                tracing::error!("Error reading message: {}", e);
                 break;
             }
         }
-    }
-    
-    // Final statistics
-    if latency_stats.count > 0 {
-        println!("\n🎯 === Final High-Resolution Latency Report ===");
-        println!("   📊 Total order book updates: {}", latency_stats.count);
-        println!("   ⚡ Average latency: {:.3}ms", latency_stats.average_latency_ms());
-        println!("   🟢 Best latency: {:.3}ms", latency_stats.min_latency_ms());
-        println!("   🔴 Worst latency: {:.3}ms", latency_stats.max_latency_ms());
-        
-        // Enhanced statistics with nanosecond precision
-        if latency_stats.count >= 10 {
-            let avg_ns = latency_stats.total_latency_ns as f64 / latency_stats.count as f64;
-            let p95_threshold = avg_ns * 2.0;
-            let outliers = latency_stats.last_10.iter()
-                .filter(|&&ns| ns as f64 > p95_threshold)
-                .count();
-            
-            println!("   📈 Measurements above 2x average: {} ({:.1}%)", 
-                   outliers,
-                   (outliers as f64 / latency_stats.last_10.len() as f64) * 100.0);
-            
-            // Show precision achieved
-            let timer = HIGH_RES_TIMER.get().unwrap();
-            
-            #[cfg(target_arch = "x86_64")]
-            let precision_info = {
-                let precision_ns = 1_000_000_000.0 / timer.cycles_per_ns;
-                format!("🎯 RDTSC precision: {:.1}ns per measurement", precision_ns)
-            };
-            
-            #[cfg(not(target_arch = "x86_64"))]
-            let precision_info = format!("🎯 Monotonic clock precision: ~1-10ns per measurement");
-            
-            println!("   {}", precision_info);
-            println!("   🚀 Measurement overhead: ~{} (vs ~1ms for system calls)", 
-                   if cfg!(target_arch = "x86_64") { "20ns" } else { "100ns" });
+
+        if last_stats_print.elapsed() >= STATS_INTERVAL && latency_stats.count > 0 {
+            print_stats(&latency_stats, STATS_INTERVAL.as_secs());
+            last_stats_print = Instant::now();
         }
     }
-    
-    println!("👋 High-resolution latency measurement completed!");
+
+    if latency_stats.count > 0 {
+        print_final_stats(&latency_stats);
+    }
+
+    println!("Done.");
     Ok(())
+}
+
+fn print_stats(stats: &LatencyStats, interval_secs: u64) {
+    println!("\n=== Latency Statistics (last {}s) ===", interval_secs);
+    println!("  Total measurements: {}", stats.count);
+    println!("  Average:            {:.3}ms", stats.average_latency_ms());
+    println!("  Recent avg (10):    {:.3}ms", stats.recent_average_ms());
+    println!("  Min:                {:.3}ms", stats.min_latency_ms());
+    println!("  Max:                {:.3}ms", stats.max_latency_ms());
+
+    if stats.last_10.len() >= 5 {
+        let recent: Vec<String> = stats.last_10.iter()
+            .map(|&ns| format!("{:.3}ms", ns as f64 / 1_000_000.0))
+            .collect();
+        println!("  Recent:             [{}]", recent.join(", "));
+    }
+
+    if stats.count > 10 {
+        let last_10: Vec<u64> = stats.last_10.iter().copied().collect();
+        let std_dev = calculate_std_dev(&last_10);
+        println!("  Std dev (recent):   {:.3}ms", std_dev / 1_000_000.0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if let Some(timer) = latency::HIGH_RES_TIMER.get() {
+        let precision_ns = 1_000_000_000.0 / timer.cycles_per_ns;
+        println!("  RDTSC precision:    {:.1}ns", precision_ns);
+    }
+
+    println!();
+}
+
+fn print_final_stats(stats: &LatencyStats) {
+    println!("\n=== Final Latency Report ===");
+    println!("  Total updates: {}", stats.count);
+    println!("  Average:       {:.3}ms", stats.average_latency_ms());
+    println!("  Best:          {:.3}ms", stats.min_latency_ms());
+    println!("  Worst:         {:.3}ms", stats.max_latency_ms());
 }
 
 fn calculate_std_dev(values: &[u64]) -> f64 {
     if values.len() < 2 {
         return 0.0;
     }
-    
+
     let mean = values.iter().sum::<u64>() as f64 / values.len() as f64;
     let variance = values.iter()
         .map(|&x| {
@@ -229,43 +186,6 @@ fn calculate_std_dev(values: &[u64]) -> f64 {
             diff * diff
         })
         .sum::<f64>() / values.len() as f64;
-    
+
     variance.sqrt()
 }
-
-fn extract_timestamp_from_message(text: &str) -> Option<u64> {
-    // OKX sends timestamps in milliseconds in the "ts" field
-    // Example: "ts":"1640995200000"
-    if let Some(start) = text.find("\"ts\":\"") {
-        let start_pos = start + 6; // Skip "ts":"
-        if let Some(end) = text[start_pos..].find("\"") {
-            let ts_str = &text[start_pos..start_pos + end];
-            return ts_str.parse::<u64>().ok();
-        }
-    }
-    None
-}
-
-/*
-local WEBSOCKET code
-📈 === High-Resolution Latency Statistics (last 5 seconds) ===
-   📊 Total measurements: 27
-   ⚡ Average latency: 168.203ms
-   🚀 Recent average (last 10): 167.832ms
-   🟢 Min latency: 155.021ms
-   🔴 Max latency: 266.652ms
-   📊 Recent latencies: [160.691ms, 155.427ms, 155.368ms, 155.567ms, 155.910ms, 182.178ms, 155.172ms, 155.799ms, 157.587ms, 244.625ms]
-   📏 Recent std deviation: 26.769ms (26769μs)
-*/
-
-/*
-tungestenite code
-📈 === High-Resolution Latency Statistics (last 5 seconds) ===
-   📊 Total measurements: 20
-   ⚡ Average latency: 166.111ms
-   🚀 Recent average (last 10): 169.565ms
-   🟢 Min latency: 159.323ms
-   🔴 Max latency: 233.551ms
-   📊 Recent latencies: [161.572ms, 160.383ms, 167.588ms, 159.538ms, 163.958ms, 164.162ms, 159.685ms, 164.692ms, 160.526ms, 233.551ms]
-   📏 Recent std deviation: 21.472ms (21472μs)
-*/

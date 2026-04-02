@@ -1,6 +1,8 @@
-use std::time::{Duration, Instant};
+use std::{str::FromStr, time::{Duration, Instant}};
 
 use latency::{current_timestamp_ns_hires, LatencyStats, HIGH_RES_TIMER};
+use tungstenite::{connect, Message};
+use url::Url;
 use websocket::{WebSocketClient, WebSocketConfig, WebSocketError, WebSocketMessage, Result};
 
 mod latency;
@@ -10,19 +12,21 @@ mod websocket;
 
 fn main() -> Result<()> {
     
-    let config = WebSocketConfig {
-        connect_timeout: Duration::from_secs(10),
-        read_timeout: Some(Duration::from_secs(30)),
-        write_timeout: Some(Duration::from_secs(10)),
-        max_frame_size: 1024 * 1024, // 1MB
-        ping_interval: Duration::from_secs(30),
-        user_agent: "OKXWebSocketClient/1.0".to_string(),
-    };
+    // let config = WebSocketConfig {
+    //     connect_timeout: Duration::from_secs(10),
+    //     read_timeout: Some(Duration::from_secs(30)),
+    //     write_timeout: Some(Duration::from_secs(10)),
+    //     max_frame_size: 1024 * 1024, // 1MB
+    //     ping_interval: Duration::from_secs(30),
+    //     user_agent: "OKXWebSocketClient/1.0".to_string(),
+    // };
     
-    let mut client = WebSocketClient::connect_with_config(
-        "wss://ws.okx.com:8443/ws/v5/public",
-        config
-    )?;
+    // let mut client = WebSocketClient::connect_with_config(
+    //     "wss://ws.okx.com:8443/ws/v5/public",
+    //     config
+    // )?;
+
+    let mut socket = connect("wss://ws.okx.com:8443/ws/v5/public").unwrap().0;
     
     let orderbook_subscribe = r#"{
         "op": "subscribe",
@@ -34,7 +38,10 @@ fn main() -> Result<()> {
         ]
     }"#;
     
-    client.send_text(orderbook_subscribe)?;
+    // client.send_text(orderbook_subscribe)?;
+
+    socket.send(Message::Text(orderbook_subscribe.into()));
+
 
     let mut latency_stats = LatencyStats::new();
     let mut last_stats_print = Instant::now();
@@ -45,11 +52,10 @@ fn main() -> Result<()> {
 
     // logic to listen to the messages and calculate latency
     loop {
-        match client.read_message() {
+        match socket.read_message() {
             Ok(msg) => {
-                
                 match msg {
-                    WebSocketMessage::Text(text) => {
+                    Message::Text(text) => {
                         // Check if this is a subscription confirmation
                         if text.contains("\"event\":\"subscribe\"") && text.contains("\"channel\":\"books5\"") {
                             println!("✅ Successfully subscribed to BTC-USDT order book");
@@ -78,19 +84,54 @@ fn main() -> Result<()> {
                                 println!("⚠️  Could not extract timestamp from order book message");
                             }
                         }
+                    },
+                    _ => {
+                        println!("Received non-text message: {:?}", msg);
                     }
-                    WebSocketMessage::Ping(_) => {
-                        println!("🏓 Received ping from OKX");
-                    }
-                    WebSocketMessage::Pong(_) => {
-                        println!("🏓 Received pong from OKX");
-                    }
-                    WebSocketMessage::Close { code, reason } => {
-                        println!("❌ Connection closed by OKX - Code: {:?}, Reason: {}", code, reason);
-                        break;
-                    }
-                    _ => {}
                 }
+                // match msg {
+                //     WebSocketMessage::Text(text) => {
+                //         // Check if this is a subscription confirmation
+                //         if text.contains("\"event\":\"subscribe\"") && text.contains("\"channel\":\"books5\"") {
+                //             println!("✅ Successfully subscribed to BTC-USDT order book");
+                //             continue;
+                //         }
+                        
+                //         // Check if this is order book data
+                //         if text.contains("\"channel\":\"books5\"") && text.contains("\"data\":[") {
+                //             let receive_time_ns = current_timestamp_ns_hires();
+
+                //             println!("{:?}", text);
+                            
+                //             if let Some(exchange_timestamp_ms) = extract_timestamp_from_message(&text) {
+                //                 let exchange_timestamp_ns = exchange_timestamp_ms * 1_000_000; // Convert ms to ns
+                //                 let latency_ns = receive_time_ns.saturating_sub(exchange_timestamp_ns);
+                //                 let latency_ms = latency_ns as f64 / 1_000_000.0;
+                                
+                //                 latency_stats.add_measurement(latency_ns);
+                                
+                //                 // Print individual measurements (for first few or outliers)
+                //                 if latency_stats.count <= 5 || latency_ns > 100_000_000 { // 100ms in ns
+                //                     println!("📚 Order book update #{}: {:.3}ms latency ({:.0}ns precision)", 
+                //                            latency_stats.count, latency_ms, latency_ns as f64 % 1_000_000.0);
+                //                 }
+                //             } else {
+                //                 println!("⚠️  Could not extract timestamp from order book message");
+                //             }
+                //         }
+                //     }
+                //     WebSocketMessage::Ping(_) => {
+                //         println!("🏓 Received ping from OKX");
+                //     }
+                //     WebSocketMessage::Pong(_) => {
+                //         println!("🏓 Received pong from OKX");
+                //     }
+                //     WebSocketMessage::Close { code, reason } => {
+                //         println!("❌ Connection closed by OKX - Code: {:?}, Reason: {}", code, reason);
+                //         break;
+                //     }
+                //     _ => {}
+                // }
                 
                 // Print periodic statistics
                 if last_stats_print.elapsed() >= stats_interval && latency_stats.count > 0 {
@@ -120,13 +161,13 @@ fn main() -> Result<()> {
                     last_stats_print = Instant::now();
                 }
             }
-            Err(WebSocketError::Timeout) => {
-                println!("⏰ Read timeout, sending ping...");
-                if let Err(e) = client.send_ping(b"latency-test") {
-                    eprintln!("❌ Failed to send ping: {}", e);
-                    break;
-                }
-            }
+            // Err(WebSocketError::Timeout) => {
+            //     println!("⏰ Read timeout, sending ping...");
+            //     if let Err(e) = client.send_ping(b"latency-test") {
+            //         eprintln!("❌ Failed to send ping: {}", e);
+            //         break;
+            //     }
+            // }
             Err(e) => {
                 eprintln!("❌ Error reading message: {}", e);
                 break;
@@ -204,3 +245,27 @@ fn extract_timestamp_from_message(text: &str) -> Option<u64> {
     }
     None
 }
+
+/*
+local WEBSOCKET code
+📈 === High-Resolution Latency Statistics (last 5 seconds) ===
+   📊 Total measurements: 27
+   ⚡ Average latency: 168.203ms
+   🚀 Recent average (last 10): 167.832ms
+   🟢 Min latency: 155.021ms
+   🔴 Max latency: 266.652ms
+   📊 Recent latencies: [160.691ms, 155.427ms, 155.368ms, 155.567ms, 155.910ms, 182.178ms, 155.172ms, 155.799ms, 157.587ms, 244.625ms]
+   📏 Recent std deviation: 26.769ms (26769μs)
+*/
+
+/*
+tungestenite code
+📈 === High-Resolution Latency Statistics (last 5 seconds) ===
+   📊 Total measurements: 20
+   ⚡ Average latency: 166.111ms
+   🚀 Recent average (last 10): 169.565ms
+   🟢 Min latency: 159.323ms
+   🔴 Max latency: 233.551ms
+   📊 Recent latencies: [161.572ms, 160.383ms, 167.588ms, 159.538ms, 163.958ms, 164.162ms, 159.685ms, 164.692ms, 160.526ms, 233.551ms]
+   📏 Recent std deviation: 21.472ms (21472μs)
+*/
